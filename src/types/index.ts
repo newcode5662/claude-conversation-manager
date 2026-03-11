@@ -55,3 +55,13 @@ export interface ImportResult {
   imported: number;
   errors: string[];
 }
+
+// Full conversation message from session file
+export interface ConversationMessage {
+  uuid: string;
+  parent_uuid?: string;
+  role: 'user' | 'assistant' | string;
+  content: string;
+  model?: string;
+  timestamp: number;
+}

@@ -1,18 +1,19 @@
 import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
-import type { Session, Prompt, FilterOptions, ViewMode, StatsData } from '../types';
+import type { Session, Prompt, FilterOptions, ViewMode, StatsData, ConversationMessage } from '../types';
 
 interface SessionState {
   sessions: Session[];
-  selectedSession: (Session & { prompts?: Prompt[] }) | null;
+  selectedSession: (Session & { prompts?: Prompt[]; messages?: ConversationMessage[] }) | null;
   selectedIds: Set<string>;
   viewMode: ViewMode;
   filterOptions: FilterOptions;
   isLoading: boolean;
   error: string | null;
   setSessions: (sessions: Session[]) => void;
-  selectSession: (session: (Session & { prompts?: Prompt[] }) | null) => void;
+  selectSession: (session: (Session & { prompts?: Prompt[]; messages?: ConversationMessage[] }) | null) => void;
   loadSession: (sessionId: string) => Promise<void>;
+  loadMessages: (sessionId: string) => Promise<ConversationMessage[]>;
   toggleSelection: (id: string) => void;
   selectAll: (ids: string[]) => void;
   clearSelection: () => void;
@@ -20,7 +21,7 @@ interface SessionState {
   archiveSelected: () => Promise<void>;
   setViewMode: (mode: ViewMode) => void;
   setFilterOptions: (options: Partial<FilterOptions>) => void;
-  importHistory: (jsonlData: string) => Promise<{ success: boolean; message: string }>;
+  importHistory: (jsonlData: string, filePath?: string) => Promise<{ success: boolean; message: string }>;
   refreshSessions: () => Promise<void>;
   loadStats: () => Promise<StatsData>;
 }
@@ -49,13 +50,26 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 
   loadSession: async (sessionId) => {
     try {
-      const prompts = await invoke<Prompt[]>('get_prompts', { sessionId });
+      const [prompts, messages] = await Promise.all([
+        invoke<Prompt[]>('get_prompts', { sessionId }),
+        invoke<ConversationMessage[]>('get_conversation_messages', { sessionId }),
+      ]);
       const session = get().sessions.find(s => s.session_id === sessionId);
       if (session) {
-        set({ selectedSession: { ...session, prompts } });
+        set({ selectedSession: { ...session, prompts, messages } });
       }
     } catch (error) {
       console.error('Failed to load session:', error);
+    }
+  },
+
+  loadMessages: async (sessionId) => {
+    try {
+      const messages = await invoke<ConversationMessage[]>('get_conversation_messages', { sessionId });
+      return messages;
+    } catch (error) {
+      console.error('Failed to load messages:', error);
+      return [];
     }
   },
 
@@ -110,14 +124,16 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       filterOptions: { ...state.filterOptions, ...options },
     })),
 
-  importHistory: async (jsonlData) => {
+  importHistory: async (jsonlData: string, filePath?: string) => {
     console.log('[importHistory] Starting import, data length:', jsonlData.length);
+    console.log('[importHistory] File path:', filePath);
     console.log('[importHistory] First 200 chars:', jsonlData.substring(0, 200));
 
     try {
       const imported = await invoke<number>('import_history', {
         jsonlData: jsonlData,
         isCliFormat: true,
+        historyFilePath: filePath || null,
       });
 
       console.log('[importHistory] Success, imported:', imported);

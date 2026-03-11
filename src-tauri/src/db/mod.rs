@@ -44,7 +44,7 @@ async fn create_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
             is_archived BOOLEAN NOT NULL DEFAULT 0
         );
 
-        -- Prompts table (individual user prompts)
+        -- Prompts table (individual user prompts from history.jsonl)
         CREATE TABLE IF NOT EXISTS prompts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT NOT NULL,
@@ -54,10 +54,28 @@ async fn create_tables(pool: &SqlitePool) -> Result<(), anyhow::Error> {
             FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
         );
 
+        -- Messages table (full conversation from session files)
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            uuid TEXT UNIQUE NOT NULL,
+            session_id TEXT NOT NULL,
+            parent_uuid TEXT,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            model TEXT,
+            input_tokens INTEGER,
+            output_tokens INTEGER,
+            timestamp INTEGER NOT NULL,
+            FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+        );
+
         -- Indexes
         CREATE INDEX IF NOT EXISTS idx_prompts_session ON prompts(session_id);
         CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at);
         CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_path);
+        CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
+        CREATE INDEX IF NOT EXISTS idx_messages_uuid ON messages(uuid);
+        CREATE INDEX IF NOT EXISTS idx_messages_parent ON messages(parent_uuid);
         "#
     )
     .execute(pool)
@@ -88,4 +106,18 @@ pub struct Prompt {
     pub display: String,
     pub timestamp: i64,
     pub idx: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
+pub struct Message {
+    pub id: i64,
+    pub uuid: String,
+    pub session_id: String,
+    pub parent_uuid: Option<String>,
+    pub role: String,
+    pub content: String,
+    pub model: Option<String>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub timestamp: i64,
 }

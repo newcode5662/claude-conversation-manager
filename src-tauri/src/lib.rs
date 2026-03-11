@@ -23,6 +23,7 @@ pub fn run() {
             get_sessions,
             get_session,
             get_prompts,
+            get_conversation_messages,
             delete_sessions,
             archive_sessions,
             get_stats,

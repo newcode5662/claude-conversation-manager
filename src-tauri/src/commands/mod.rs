@@ -1,6 +1,7 @@
-use crate::db::{get_db, Session, Prompt};
+use crate::db::{get_db, Session, Prompt, Message};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CliHistoryEntry {
@@ -30,7 +31,7 @@ pub struct ImportPrompt {
 }
 
 #[tauri::command]
-pub async fn import_history(jsonl_data: String, is_cli_format: bool) -> Result<usize, String> {
+pub async fn import_history(jsonl_data: String, is_cli_format: bool, history_file_path: Option<String>) -> Result<usize, String> {
     eprintln!("=== import_history called ===");
     eprintln!("is_cli_format={}", is_cli_format);
     eprintln!("jsonl_data length={}", jsonl_data.len());
@@ -62,6 +63,13 @@ pub async fn import_history(jsonl_data: String, is_cli_format: bool) -> Result<u
     eprintln!("Grouped into {} sessions", sessions.len());
 
     let mut imported = 0;
+
+    // Get history file path for loading session files
+    let history_path = history_file_path.or_else(|| {
+        dirs::home_dir()
+            .map(|h| h.join(".claude").join("history.jsonl"))
+            .map(|p| p.to_string_lossy().to_string())
+    });
 
     for session in &sessions {
         eprintln!("Inserting session: {}, prompts: {}", session.session_id, session.prompts.len());
@@ -110,6 +118,52 @@ pub async fn import_history(jsonl_data: String, is_cli_format: bool) -> Result<u
             .execute(&pool)
             .await {
                 eprintln!("Error inserting prompt: {}", e);
+            }
+        }
+
+        // Try to load and store full conversation from session file
+        if let Some(ref history_path) = history_path {
+            match load_session_messages(history_path, &session.session_id).await {
+                Ok(messages) if !messages.is_empty() => {
+                    eprintln!("Loaded {} messages for session {}", messages.len(), session.session_id);
+
+                    // Clear existing messages
+                    let _ = sqlx::query("DELETE FROM messages WHERE session_id = ?1")
+                        .bind(&session.session_id)
+                        .execute(&pool)
+                        .await;
+
+                    // Insert messages
+                    for msg in messages {
+                        if let Err(e) = sqlx::query(
+                            r#"
+                            INSERT INTO messages
+                            (uuid, session_id, parent_uuid, role, content, model, timestamp)
+                            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                            ON CONFLICT(uuid) DO UPDATE SET
+                            content = excluded.content,
+                            timestamp = excluded.timestamp
+                            "#
+                        )
+                        .bind(&msg.uuid)
+                        .bind(&session.session_id)
+                        .bind(&msg.parent_uuid)
+                        .bind(&msg.role)
+                        .bind(&msg.content)
+                        .bind(&msg.model)
+                        .bind(msg.timestamp)
+                        .execute(&pool)
+                        .await {
+                            eprintln!("Error inserting message: {}", e);
+                        }
+                    }
+                }
+                Ok(_) => {
+                    eprintln!("No session file found for {}", session.session_id);
+                }
+                Err(e) => {
+                    eprintln!("Error loading session file for {}: {}", session.session_id, e);
+                }
             }
         }
 
@@ -401,4 +455,234 @@ pub struct Stats {
     pub total_prompts: i64,
     pub unique_projects: i64,
     pub by_date: Vec<(String, i64)>,
+}
+
+// ===== Session File Message Structures =====
+
+#[derive(Debug, Deserialize)]
+struct SessionFileEntry {
+    #[serde(rename = "type")]
+    entry_type: String,
+    #[serde(rename = "sessionId")]
+    session_id: Option<String>,
+    uuid: Option<String>,
+    #[serde(rename = "parentUuid")]
+    parent_uuid: Option<String>,
+    timestamp: Option<String>,
+    message: Option<SessionMessage>,
+    #[serde(rename = "userType")]
+    user_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionMessage {
+    role: Option<String>,
+    content: Option<serde_json::Value>,
+    id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ConversationMessage {
+    pub uuid: String,
+    pub parent_uuid: Option<String>,
+    pub role: String,
+    pub content: String,
+    pub model: Option<String>,
+    pub timestamp: i64,
+}
+
+/// Load full conversation from session file
+async fn load_session_messages(
+    history_file_path: &str,
+    session_id: &str,
+) -> Result<Vec<ConversationMessage>, String> {
+    // Derive session file path from history file path and session_id
+    // history.jsonl is at: ~/.claude/history.jsonl
+    // session file is at: ~/.claude/projects/{project_name}/{session_id}.jsonl
+
+    let history_path = PathBuf::from(history_file_path);
+    let claude_dir = history_path.parent().ok_or("Invalid history file path")?;
+
+    // Try to find session file in projects directory
+    let projects_dir = claude_dir.join("projects");
+
+    if !projects_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    // Search for session file recursively
+    let session_file = find_session_file(&projects_dir, session_id).await?;
+
+    let Some(session_path) = session_file else {
+        return Ok(Vec::new());
+    };
+
+    // Read and parse session file
+    let content = tokio::fs::read_to_string(&session_path)
+        .await
+        .map_err(|e| format!("Failed to read session file: {}", e))?;
+
+    let mut messages = Vec::new();
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let entry: SessionFileEntry = match serde_json::from_str(line) {
+            Ok(e) => e,
+            Err(_) => continue, // Skip non-message lines (like snapshots)
+        };
+
+        // Skip non-conversation entries
+        if entry.entry_type != "user" && entry.entry_type != "assistant" {
+            continue;
+        }
+
+        let Some(uuid) = entry.uuid else { continue };
+        let Some(timestamp_str) = entry.timestamp else { continue };
+        let Some(message) = entry.message else { continue };
+
+        // Parse timestamp
+        let timestamp = match timestamp_str.parse::<chrono::DateTime<chrono::Utc>>() {
+            Ok(dt) => dt.timestamp_millis(),
+            Err(_) => continue,
+        };
+
+        let role = message.role.unwrap_or_else(|| entry.entry_type.clone());
+        let content = extract_message_content(&message.content);
+
+        messages.push(ConversationMessage {
+            uuid,
+            parent_uuid: entry.parent_uuid,
+            role,
+            content,
+            model: None, // Will be extracted from assistant messages
+            timestamp,
+        });
+    }
+
+    // Sort by timestamp to maintain conversation order
+    messages.sort_by_key(|m| m.timestamp);
+
+    Ok(messages)
+}
+
+async fn find_session_file(projects_dir: &PathBuf, session_id: &str) -> Result<Option<PathBuf>, String> {
+    let mut entries = tokio::fs::read_dir(projects_dir)
+        .await
+        .map_err(|e| format!("Failed to read projects directory: {}", e))?;
+
+    while let Some(entry) = entries.next_entry().await.map_err(|e| e.to_string())? {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let session_file = path.join(format!("{}.jsonl", session_id));
+        if session_file.exists() {
+            return Ok(Some(session_file));
+        }
+
+        // Search one level deeper (some projects may have nested structure)
+        let mut sub_entries = tokio::fs::read_dir(&path)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        while let Some(sub_entry) = sub_entries.next_entry().await.map_err(|e| e.to_string())? {
+            let sub_path = sub_entry.path();
+            if sub_path.is_dir() {
+                let nested_session_file = sub_path.join(format!("{}.jsonl", session_id));
+                if nested_session_file.exists() {
+                    return Ok(Some(nested_session_file));
+                }
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn extract_message_content(content: &Option<serde_json::Value>) -> String {
+    let Some(content) = content else {
+        return String::new();
+    };
+
+    // Handle different content formats
+    match content {
+        // String content (user messages)
+        serde_json::Value::String(s) => s.clone(),
+        // Array content (assistant messages with thinking blocks)
+        serde_json::Value::Array(arr) => {
+            let mut result = String::new();
+            for item in arr {
+                if let serde_json::Value::Object(obj) = item {
+                    if let Some(serde_json::Value::String(text)) = obj.get("text") {
+                        result.push_str(text);
+                    } else if let Some(serde_json::Value::String(thinking)) = obj.get("thinking") {
+                        // Include thinking content with a marker
+                        result.push_str("\n<thinking>\n");
+                        result.push_str(thinking);
+                        result.push_str("\n</thinking>\n");
+                    }
+                }
+            }
+            result
+        }
+        // Object content
+        serde_json::Value::Object(obj) => {
+            if let Some(serde_json::Value::String(text)) = obj.get("text") {
+                text.clone()
+            } else {
+                content.to_string()
+            }
+        }
+        _ => content.to_string(),
+    }
+}
+
+#[tauri::command]
+pub async fn get_conversation_messages(session_id: String) -> Result<Vec<ConversationMessage>, String> {
+    let pool = get_db()?;
+
+    // First try to get from database
+    let messages: Vec<ConversationMessage> = sqlx::query_as::<_, Message>(
+        r#"
+        SELECT id, uuid, session_id, parent_uuid, role, content, model, input_tokens, output_tokens, timestamp
+        FROM messages
+        WHERE session_id = ?1
+        ORDER BY timestamp ASC
+        "#
+    )
+    .bind(&session_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .into_iter()
+    .map(|m| ConversationMessage {
+        uuid: m.uuid,
+        parent_uuid: m.parent_uuid,
+        role: m.role,
+        content: m.content,
+        model: m.model,
+        timestamp: m.timestamp,
+    })
+    .collect();
+
+    if !messages.is_empty() {
+        return Ok(messages);
+    }
+
+    // If not in database, try to load from session file
+    // We need the history file path - use default location
+    let home_dir = dirs::home_dir().ok_or("Cannot find home directory")?;
+    let history_file = home_dir.join(".claude").join("history.jsonl");
+
+    if history_file.exists() {
+        let file_path = history_file.to_string_lossy().to_string();
+        return load_session_messages(&file_path, &session_id).await;
+    }
+
+    Ok(Vec::new())
 }
